@@ -1,0 +1,91 @@
+on:
+  - push
+  - workflow_dispatch
+
+permissions: write-all
+
+name: Build
+
+env:
+  DOCKER_REGISTRY: ${{ vars.ARTIFACTORY_HOSTNAME }}
+  DOCKER_REPOSITORY: ${{ vars.ARTIFACTORY_PROJECT }}-docker-local/applications
+  IMAGE_NAME: bff-service
+
+jobs:
+  build_and_deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python and uv
+        uses: p6m-actions/python-uv-setup@v1
+        with:
+          python-version: "3.11"
+
+      - name: Login to Python Repository
+        uses: p6m-actions/python-uv-repository-login@v1
+        with:
+          credentials: |
+            artifactory=${{ secrets.ARTIFACTORY_USERNAME }}:${{ secrets.ARTIFACTORY_IDENTITY_TOKEN }}
+
+      - name: Cut Patch Version
+        id: cut-patch
+        uses: p6m-actions/python-uv-cut-tag@v1
+        with:
+          version-level: patch
+
+      - name: Build Python Application
+        uses: p6m-actions/python-uv-build@v1
+        with:
+          modules: "bff-service-api bff-service-core bff-service-persistence bff-service-server bff-service-client"
+          run-tests: true
+
+      - name: Login to Docker Repository
+        uses: p6m-actions/docker-repository-login@v1
+        with:
+          registry: ${{ vars.ARTIFACTORY_HOSTNAME }}
+          username: ${{ secrets.ARTIFACTORY_USERNAME }}
+          password: ${{ secrets.ARTIFACTORY_IDENTITY_TOKEN }}
+
+      - name: Build and Publish Docker Image
+        id: docker-publish
+        uses: p6m-actions/python-uv-docker-publish@v1
+        with:
+          image-name: bff-service-server
+          image-tag: ${{ github.sha }}
+          registry: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REPOSITORY }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+        env:
+          DOCKER_BUILDKIT: 1
+          DOCKER_CLI_EXPERIMENTAL: enabled
+
+      - name: Make Artifacts
+        run: |
+          echo '${{ steps.docker-publish.outputs.image-digest }}' | tee digest.txt
+
+      - uses: ncipollo/release-action@v1
+        with:
+          name: Version ${{ steps.cut-patch.outputs.version }}
+          tag: ${{ steps.cut-patch.outputs.tag }}
+          makeLatest: true
+          artifacts: "digest.txt"
+          removeArtifacts: true
+          generateReleaseNotes: true
+          body: |
+            Application version: `${{ steps.cut-patch.outputs.version }}`
+            Docker image digest: `${{ steps.docker-publish.outputs.image-digest }}`
+
+      - name: Update Application Manifest
+        uses: p6m-actions/platform-application-manifest-dispatch@v1
+        with:
+          repository: ${{ github.repository }}
+          image-name: ${{ env.IMAGE_NAME }}
+          environment: "dev"
+          digest: ${{ steps.docker-publish.outputs.image-digest }}
+          update-manifest-token: ${{ secrets.UPDATE_MANIFEST_TOKEN }}
+          platform-dispatch-url: ${{ vars.PLATFORM_DISPATCH_URL }}
+          directory-name: bff-service
+        if: always()

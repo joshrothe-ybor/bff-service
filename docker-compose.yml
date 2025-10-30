@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  "bff-service":
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: "bff-service"
+    ports:
+      - "8000:8000"  # FastAPI REST port
+      - "8080:8080"  # Management HTTP port
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/bff_service
+      - LOGGING_LEVEL=INFO
+      - LOGGING_FORMAT=json
+      - DEBUG=true
+      - MANAGEMENT_ENABLED=true
+      - METRICS_ENABLED=true
+      - METRICS_PROMETHEUS_ENABLED=true
+      - JWT_SECRET_KEY=your-secret-key-here-change-in-production
+      - JWT_ALGORITHM=HS256
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - CORS_ORIGINS=["http://localhost:3000", "http://localhost:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - "bff-service-network"
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: "bff-service-postgres"
+    environment:
+      - POSTGRES_DB=bff_service
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bff_service"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - "bff-service-network"
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: "bff-service-prometheus"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - "bff-service"
+    restart: unless-stopped
+    networks:
+      - "bff-service-network"
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: "bff-service-grafana"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - "bff-service-network"
+
+volumes:
+  postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  "bff-service-network":
+    driver: bridge

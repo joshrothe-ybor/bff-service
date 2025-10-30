@@ -1,0 +1,56 @@
+name: Promote Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (stg, prd)'
+        type: choice
+        options:
+          - stg
+          - prd
+        required: true
+      tag:
+        description: 'Tag to promote'
+        type: string
+        required: true
+
+run-name: Promote ${{ inputs.tag }} to ${{ inputs.environment }}
+
+permissions:
+  contents: write # Required for editing releases
+
+jobs:
+  promote:
+    name: Promote Tag to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get extra parameters for CICD
+        env:
+          TZ: UTC # Ensure date command uses UTC for timezone.
+          GH_TOKEN: ${{ github.token }} # Set token for github CLI
+        run: |
+          echo "GITHUB_REPOSITORY_BASENAME=$(basename ${GITHUB_REPOSITORY})" | tee -a $GITHUB_ENV
+          gh release download ${{ inputs.tag }} --repo ${{ github.repository }} --pattern "digest.txt"
+          echo "DIGEST_TO_PROMOTE=$(cat digest.txt)" | tee -a $GITHUB_ENV
+          CURRENT_TIMESTAMP=$(date +'%Y-%m-%d %H:%M:%S %Z')
+          gh release view ${{ inputs.tag }} --repo ${{ github.repository }} --json body -q .body > ${RUNNER_TEMP}/release_notes.md
+          echo "Released to ${{ inputs.environment }} by @${{ github.triggering_actor }} on ${CURRENT_TIMESTAMP}" >> ${RUNNER_TEMP}/release_notes.md
+
+      - name: Update Application Manifest
+        uses: p6m-actions/platform-application-manifest-dispatch@v1
+        with:
+          repository: ${{ github.repository }}
+          image-name: ${{ env.GITHUB_REPOSITORY_BASENAME }}
+          directory-name: ${{ env.GITHUB_REPOSITORY_BASENAME }}
+          environment: ${{ inputs.environment }}
+          digest: ${{ env.DIGEST_TO_PROMOTE }}
+          update-manifest-token: ${{ secrets.UPDATE_MANIFEST_TOKEN }}
+          platform-dispatch-url: ${{ vars.PLATFORM_DISPATCH_URL }}
+
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: ${{ inputs.tag }}
+          bodyFile: ${{ runner.temp }}/release_notes.md

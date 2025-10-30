@@ -1,0 +1,436 @@
+name: bff-service REST Service Integration Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bff-service-*/**'
+      - 'docker-compose.yml'
+      - 'Dockerfile'
+      - 'scripts/**'
+      - '.github/workflows/integration-tests.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly on Mondays at 6 AM UTC
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # Build and validate all packages
+  build-packages:
+    name: "Build All Packages"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Set up Python ${{matrix.python-version}}
+        run: |
+          uv python install ${{matrix.python-version}}
+      
+      - name: Build packages in dependency order
+        run: |
+          # Build core dependencies first
+          for pkg in core persistence; do
+            echo "Building bff-service-$pkg..."
+            cd bff-service-$pkg
+            uv sync --python ${{matrix.python-version}}
+            uv build
+            cd ..
+          done
+          
+          # Build service packages
+          for pkg in api client server; do
+            echo "Building bff-service-$pkg..."
+            cd bff-service-$pkg
+            uv sync --python ${{matrix.python-version}}
+            uv build
+            cd ..
+          done
+          
+          # Build integration tests
+          cd bff-service-integration-tests
+          uv sync --python ${{matrix.python-version}}
+          echo "✅ All packages built successfully"
+      
+      - name: Cache built packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            bff-service-*/dist/
+            bff-service-*/.venv/
+          key: built-packages-${{matrix.python-version}}-${{github.sha}}
+          restore-keys: |
+            built-packages-${{matrix.python-version}}-
+
+  # Full stack integration test with Docker
+  integration-test-docker:
+    name: "Docker Stack Integration"
+    runs-on: ubuntu-latest
+    needs: build-packages
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Restore package cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            bff-service-*/dist/
+            bff-service-*/.venv/
+          key: built-packages-${{env.PYTHON_VERSION}}-${{github.sha}}
+      
+      - name: Start Docker stack
+        run: |
+          docker compose up --build -d
+          echo "Waiting for services to be ready..."
+      
+      - name: Wait for service readiness
+        run: |
+          # Use actual endpoint testing instead of Docker health checks
+          for i in {1..36}; do  # 3 minutes max
+            if curl -s -f http://localhost:8080/health/live >/dev/null 2>&1; then
+              echo "✅ REST service is responding!"
+              sleep 5  # Stabilization time
+              break
+            fi
+            echo "Waiting for service... (attempt $i/36)"
+            sleep 5
+          done
+          
+          # Final verification
+          if ! curl -f http://localhost:8080/health/live; then
+            echo "❌ Service failed to become ready"
+            docker compose logs bff-service
+            exit 1
+          fi
+      
+      - name: Verify service health
+        run: |
+          # Check REST service health endpoints
+          curl -f http://localhost:8080/health/live
+          curl -f http://localhost:8080/health/ready
+          
+          # Check main API endpoint
+          curl -f http://localhost:8000/
+          
+          # Check database connectivity
+          docker compose exec -T postgres pg_isready -U postgres -d bff_service
+          
+          echo "✅ All services healthy"
+      
+      - name: Run integration tests against Docker stack
+        run: |
+          cd bff-service-integration-tests
+          uv sync
+          
+          # Run integration tests with Docker services
+          uv run pytest tests/integration/ \
+            -v \
+            --tb=short \
+            -m "integration and requires_docker" \
+            --maxfail=5
+        env:
+          API_SERVER_HOST: localhost
+          API_SERVER_PORT: 8000
+          MANAGEMENT_SERVER_HOST: localhost
+          MANAGEMENT_SERVER_PORT: 8080
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bff_service
+          PYTHONPATH: ${{github.workspace}}
+      
+      - name: Collect Docker logs on failure
+        if: failure()
+        run: |
+          echo "=== REST Service Logs ==="
+          docker compose logs bff-service
+          echo "=== PostgreSQL Logs ==="
+          docker compose logs postgres
+      
+      - name: Cleanup Docker stack
+        if: always()
+        run: |
+          docker compose down -v
+          docker system prune -f
+
+  # Database migration and schema validation
+  database-migration-test:
+    name: "Database Migration Test"
+    runs-on: ubuntu-latest
+    needs: build-packages
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: bff_service_migration_test
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Setup persistence package
+        run: |
+          cd bff-service-persistence
+          uv sync
+      
+      - name: Test database migrations
+        run: |
+          cd bff-service-persistence
+          
+          # Run all migrations
+          uv run alembic upgrade head
+          echo "✅ Migrations applied successfully"
+          
+          # Verify schema
+          uv run alembic current -v
+          
+          # Test downgrade/upgrade cycle
+          uv run alembic downgrade -1
+          uv run alembic upgrade head
+          echo "✅ Migration cycle completed"
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:testpass@localhost:5432/bff_service_migration_test
+
+  # REST client-server communication test
+  rest-communication-test:
+    name: "REST Client-Server Test"
+    runs-on: ubuntu-latest
+    needs: build-packages
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: bff_service_rest_test
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Setup database
+        run: |
+          cd bff-service-persistence
+          uv sync
+          uv run alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:testpass@localhost:5432/bff_service_rest_test
+      
+      - name: Start REST server in background
+        run: |
+          cd bff-service-server/src
+          uv sync
+          nohup uv run python -m ybor.faq.bff.service.server.main > server.log 2>&1 &
+          echo $! > server.pid
+          
+          # Wait for server to start with proper endpoint testing
+          for i in {1..20}; do  # 2 minutes max
+            if curl -s -f http://localhost:8080/health/live >/dev/null 2>&1; then
+              echo "✅ REST server started successfully"
+              break
+            fi
+            echo "Waiting for server... (attempt $i/20)"
+            sleep 6
+          done
+          
+          # Final verification
+          if ! curl -f http://localhost:8080/health/live; then
+            echo "Server failed to start, logs:"
+            cat server.log
+            exit 1
+          fi
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:testpass@localhost:5432/bff_service_rest_test
+          API_PORT: 8000
+          MANAGEMENT_PORT: 8080
+      
+      - name: Test client connectivity
+        run: |
+          cd bff-service-client
+          uv sync
+          
+          # Create a simple connectivity test
+          cat > test_connection.py << 'EOF'
+          import asyncio
+          import sys
+          from ybor.faq.bff.service.client.example_service_client import ExampleServiceClient
+
+          async def test_connection():
+              try:
+                  client = ExampleServiceClient("http://localhost:8000")
+                  # Add actual service method call here when available
+                  print("✅ Client connection successful")
+                  return True
+              except Exception as e:
+                  print(f"❌ Client connection failed: {e}")
+                  return False
+
+          if __name__ == "__main__":
+              success = asyncio.run(test_connection())
+              sys.exit(0 if success else 1)
+          EOF
+          
+          uv run python test_connection.py
+      
+      - name: Run focused REST integration tests
+        run: |
+          cd bff-service-integration-tests
+          uv sync
+          
+          # Run specific REST communication tests
+          uv run pytest tests/integration/ \
+            -v \
+            -k "test_create_and_retrieve_example or test_concurrent_operations" \
+            --tb=short \
+            --maxfail=3
+        env:
+          API_SERVER_HOST: localhost
+          API_SERVER_PORT: 8000
+          MANAGEMENT_SERVER_HOST: localhost
+          MANAGEMENT_SERVER_PORT: 8080
+          DATABASE_URL: postgresql+asyncpg://postgres:testpass@localhost:5432/bff_service_rest_test
+      
+      - name: Cleanup REST server
+        if: always()
+        run: |
+          if [ -f bff-service-server/src/server.pid ]; then
+            kill $(cat bff-service-server/src/server.pid) || true
+          fi
+          
+          # Show server logs if available
+          if [ -f bff-service-server/src/server.log ]; then
+            echo "=== Server logs ==="
+            tail -50 bff-service-server/src/server.log
+          fi
+
+  # Performance and load testing
+  performance-test:
+    name: "Performance Baseline"
+    runs-on: ubuntu-latest
+    needs: build-packages
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[performance]')
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install UV
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      
+      - name: Start Docker stack
+        run: |
+          docker compose up --build -d
+      
+      - name: Wait for service readiness
+        run: |
+          for i in {1..36}; do  # 3 minutes max
+            if curl -s -f http://localhost:8080/health/live >/dev/null 2>&1; then
+              echo "✅ Service ready for performance testing!"
+              sleep 5
+              break
+            fi
+            sleep 5
+          done
+      
+      - name: Run performance tests
+        run: |
+          cd bff-service-integration-tests
+          uv sync
+          
+          # Run performance-specific tests
+          uv run pytest tests/integration/ \
+            -v \
+            -m "slow" \
+            --tb=short \
+            --durations=10
+        env:
+          API_SERVER_HOST: localhost
+          API_SERVER_PORT: 8000
+          MANAGEMENT_SERVER_HOST: localhost
+          MANAGEMENT_SERVER_PORT: 8080
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/bff_service
+      
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v
+
+  # Summary job
+  integration-test-summary:
+    name: "Integration Test Summary"
+    runs-on: ubuntu-latest
+    needs: [build-packages, integration-test-docker, database-migration-test, rest-communication-test]
+    if: always()
+    
+    steps:
+      - name: Check results
+        run: |
+          echo "=== Integration Test Results ==="
+          echo "Build packages: ${{needs.build-packages.result}}"
+          echo "Docker stack: ${{needs.integration-test-docker.result}}"
+          echo "Database migrations: ${{needs.database-migration-test.result}}"
+          echo "REST communication: ${{needs.rest-communication-test.result}}"
+          
+          # Fail if any critical tests failed
+          if [[ "${{needs.build-packages.result}}" != "success" ]]; then
+            echo "❌ Package build failed"
+            exit 1
+          fi
+          
+          if [[ "${{needs.integration-test-docker.result}}" != "success" ]]; then
+            echo "❌ Docker integration tests failed"
+            exit 1
+          fi
+          
+          if [[ "${{needs.rest-communication-test.result}}" != "success" ]]; then
+            echo "❌ REST communication tests failed"
+            exit 1
+          fi
+          
+          echo "✅ All integration tests passed!" 

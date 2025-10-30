@@ -1,0 +1,11 @@
+# IMPORTANT: Changes to this file will be applied to all environments, even if you deploy dev only.
+
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - application.yaml
+
+configurations:
+  - application-customizations.yaml

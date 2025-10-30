@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bff-service-server"
+version = "0.1.0"
+description = "BffService Production Server Component"
+authors = [
+    { name = "josh@ybor.ai" }
+]
+
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "uvicorn[standard]>=0.24.0",
+    "prometheus-client>=0.17.0",
+    "structlog>=23.1.0",
+    "pydantic-settings>=2.0.0",
+    "bff-service-api",
+    "bff-service-persistence",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+    "mypy>=1.6.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ybor"]
+
+[project.scripts]
+"bff-service-server" = "ybor.faq.bff.service.server.main:main" 
+
+[tool.uv.sources]
+bff-service-api = { path = "../bff-service-api", editable = true }
+bff-service-persistence = { path = "../bff-service-persistence", editable = true }

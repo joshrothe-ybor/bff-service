@@ -1,0 +1,5 @@
+# IMPORTANT: Changes to this file will be applied to all environments, even if you deploy dev only.
+
+images:
+  - path: spec/deployment/image
+    kind: PlatformApplication
